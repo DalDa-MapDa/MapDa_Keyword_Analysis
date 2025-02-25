@@ -13,9 +13,11 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ───────── 파일 경로 변수 설정 ─────────
 INPUT_EXCEL_PATH = os.path.join("data", "school.xlsx")
-OUTPUT_EXCEL_PATH = os.path.join("result", "emotion_analysis_result.xlsx")
+OUTPUT_DIR = "result"
+OUTPUT_EXCEL_PATH = os.path.join(OUTPUT_DIR, "emotion_analysis_result.xlsx")
 
 # ───────── 프롬프트 정의 ─────────
+# 문장이 긍정적이면 Positive, 부정적이면 Negative, 중립이면 Neutral로 응답
 SYSTEM_PROMPT = (
     "다음 문장의 전체 맥락을 고려하여 감정 분석을 진행하세요. "
     "문장이 긍정적이면 Positive로, 부정적이면 Negative로, 중립이면 Neutral로 응답하세요. "
@@ -27,7 +29,7 @@ class EmotionResultModel(BaseModel):
     result: str
 
 # ───────── 감정 분석 함수 ─────────
-def analyze_emotion(text):
+def analyze_emotion(text: str) -> str:
     """
     Gemini API를 이용하여 주어진 텍스트의 감정 분석(긍정/부정/중립)을 수행합니다.
     
@@ -35,7 +37,7 @@ def analyze_emotion(text):
         text (str): 분석할 문장
         
     Returns:
-        str: "Positive", "Negative", 또는 "Neutral" (API 응답에 따라 결과가 없으면 None)
+        str: "Positive", "Negative", "Neutral" 중 하나 (API 응답에 따라 결과가 없으면 None)
     """
     try:
         prompt = f"{SYSTEM_PROMPT} {text}"
@@ -72,46 +74,80 @@ def analyze_emotion(text):
         tqdm.write(f"Gemini API 호출 중 오류 발생: {e}")
         return None
 
-# ───────── 메인 처리 로직 ─────────
 def main():
-    # Excel 파일 읽기
+    # 결과 저장 폴더 생성 (없으면)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 1) 원본 데이터 불러오기
     try:
-        df = pd.read_excel(INPUT_EXCEL_PATH)
+        df_input = pd.read_excel(INPUT_EXCEL_PATH)
     except Exception as e:
-        print(f"엑셀 파일 읽기 오류: {e}")
+        print(f"엑셀 파일({INPUT_EXCEL_PATH}) 읽기 오류: {e}")
         return
     
     # body 컬럼이 존재하는지 확인
-    if "body" not in df.columns:
+    if "body" not in df_input.columns:
         print("엑셀 파일에 'body' 컬럼이 없습니다.")
         return
 
-    # 각 body 텍스트에 대해 감정 분석 진행
-    emotion_results = []
-    for text in tqdm(df["body"].tolist(), desc="감정 분석 진행중"):
-        if pd.isna(text):
-            emotion_results.append(None)
-        else:
-            result = analyze_emotion(str(text))
-            # 결과 문자열(Positive, Negative, Neutral 등)만 저장
-            emotion_results.append(result if result else None)
+    # 2) 이미 처리된 결과가 있는지 확인
+    if os.path.exists(OUTPUT_EXCEL_PATH):
+        # 기존 결과 불러오기
+        try:
+            df_existing = pd.read_excel(OUTPUT_EXCEL_PATH)
+        except Exception as e:
+            print(f"기존 결과 파일({OUTPUT_EXCEL_PATH}) 읽기 오류: {e}")
+            # 읽기 실패 시, 빈 데이터프레임으로 초기화
+            df_existing = pd.DataFrame(columns=["no", "title", "body", "vote", "comment", "emotion_result"])
+    else:
+        # 결과 파일이 없으면 새로 생성
+        df_existing = pd.DataFrame(columns=["no", "title", "body", "vote", "comment", "emotion_result"])
     
-    # 새로운 컬럼 emotion_result 추가
-    df["emotion_result"] = emotion_results
+    # 3) 이미 처리된 no 목록 확인
+    processed_nos = set(df_existing["no"].dropna().astype(int).tolist())
 
-    # 최종적으로 저장할 컬럼: no, title, body, vote, comment, emotion_result
-    required_columns = ["no", "title", "body", "vote", "comment", "emotion_result"]
-    df_to_save = df[required_columns]
+    # 4) 아직 처리되지 않은 행만 처리
+    for idx, row in tqdm(df_input.iterrows(), total=len(df_input), desc="감정 분석 진행중"):
+        # 현재 행의 no
+        row_no = int(row["no"]) if not pd.isna(row["no"]) else None
+        
+        # 이미 처리된 no이면 스킵
+        if row_no in processed_nos:
+            continue
+        
+        # body가 NaN이면 None 처리
+        body_text = row["body"] if not pd.isna(row["body"]) else None
+        if not body_text:
+            emotion_result = None
+        else:
+            # 감정 분석 수행
+            emotion_result = analyze_emotion(str(body_text))
+        
+        # 결과를 df_existing에 추가
+        new_row = {
+            "no": row["no"],
+            "title": row["title"],
+            "body": row["body"],
+            "vote": row["vote"],
+            "comment": row["comment"],
+            "emotion_result": emotion_result
+        }
+        # DataFrame으로 변환 후 concat
+        df_new = pd.DataFrame([new_row])
+        df_existing = pd.concat([df_existing, df_new], ignore_index=True)
+
+        # 혹시 중간에 순서가 뒤섞이지 않도록 원하는 컬럼 순서로 정렬
+        required_columns = ["no", "title", "body", "vote", "comment", "emotion_result"]
+        df_existing = df_existing[required_columns]
+
+        # 중간 저장 (바로바로 저장)
+        try:
+            df_existing.to_excel(OUTPUT_EXCEL_PATH, index=False)
+        except Exception as e:
+            tqdm.write(f"중간 저장 오류: {e}")
+            # 저장 실패 시에는 계속 진행하거나, 원하는 로직대로 처리 (여기서는 그냥 계속 진행)
     
-    # 결과 저장 폴더 생성 (없으면)
-    os.makedirs(os.path.dirname(OUTPUT_EXCEL_PATH), exist_ok=True)
-    
-    # Excel 파일로 저장
-    try:
-        df_to_save.to_excel(OUTPUT_EXCEL_PATH, index=False)
-        print(f"감정 분석 결과가 {OUTPUT_EXCEL_PATH}에 저장되었습니다.")
-    except Exception as e:
-        print(f"엑셀 파일 저장 오류: {e}")
+    print(f"최종 감정 분석 결과가 '{OUTPUT_EXCEL_PATH}'에 저장되었습니다.")
 
 if __name__ == "__main__":
     main()
